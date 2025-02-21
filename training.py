@@ -1,11 +1,20 @@
+import json
+import multiprocessing as mp
+import os
+from queue import Empty
+
 import torch
 import tqdm
-from logs import init_wandb, log_wandb, log_model_performance, save_checkpoint
-import multiprocessing as mp
-from queue import Empty
+from logs import (
+    init_wandb,
+    load_checkpoint,
+    log_model_performance,
+    log_wandb,
+    save_checkpoint,
+)
+
 import wandb
-import json
-import os
+
 
 def train_sae(sae, activation_store, model, cfg):
     num_batches = cfg["num_tokens"] // cfg["batch_size"]
@@ -13,7 +22,7 @@ def train_sae(sae, activation_store, model, cfg):
     pbar = tqdm.trange(num_batches)
 
     wandb_run = init_wandb(cfg)
-    
+
     for i in pbar:
         batch = activation_store.next_batch()
         sae_output = sae(batch)
@@ -33,7 +42,7 @@ def train_sae(sae, activation_store, model, cfg):
         optimizer.zero_grad()
 
     save_checkpoint(wandb_run, sae, cfg, i)
-    
+
 
 def train_sae_group(saes, activation_store, model, cfgs):
     num_batches = cfgs[0]["num_tokens"] // cfgs[0]["batch_size"]
@@ -64,7 +73,7 @@ def train_sae_group(saes, activation_store, model, cfgs):
             optimizer.step()
             optimizer.zero_grad()
             counter += 1
-   
+
     for sae, cfg, optimizer in zip(saes, cfgs, optimizers):
         save_checkpoint(wandb_run, sae, cfg, i)
 
@@ -102,21 +111,22 @@ def save_checkpoint_mp(sae, cfg, step):
 def train_sae_group_seperate_wandb(saes, activation_store, model, cfgs):
     def new_wandb_process(config, log_queue, entity, project):
         run = wandb.init(
-            entity=entity, 
-            project=project, 
-            config=config, 
-            name=config["name"]
+            entity=entity,
+            project=project,
+            config=config,
+            name=config["name"],
+            resume="allow"  # Allow resuming previous runs
         )
-        
+
         while True:
             try:
                 # Wait up to 1 second for new data
                 log = log_queue.get(timeout=1)
-                
+
                 # Check for termination signal
                 if log == "DONE":
                     break
-                
+
                 # Check if this is a checkpoint signal
                 if isinstance(log, dict) and log.get("checkpoint"):
                     # Create and log artifact
@@ -134,42 +144,64 @@ def train_sae_group_seperate_wandb(saes, activation_store, model, cfgs):
                     wandb.log(log)
             except Empty:
                 continue
-                
+
         wandb.finish()
-    
+
     num_batches = int(cfgs[0]["num_tokens"] // cfgs[0]["batch_size"])
-    print(f"Number of batches: {num_batches}")
-    optimizers = [torch.optim.Adam(sae.parameters(), lr=cfg["lr"], betas=(cfg["beta1"], cfg["beta2"])) 
-                 for sae, cfg in zip(saes, cfgs)]
-    pbar = tqdm.trange(num_batches)
+    print(f"Number of total batches: {num_batches}")
 
     # Initialize wandb processes and queues
     wandb_processes = []
     log_queues = []
-    
-    for i, cfg in enumerate(cfgs):
+
+    # Load latest checkpoints and initialize optimizers
+    optimizers = []
+    start_steps = []
+
+    for sae, cfg in zip(saes, cfgs):
+        # Try to load latest checkpoint
+        state_dict, start_step = load_checkpoint(cfg)
+        if state_dict is not None:
+            sae.load_state_dict(state_dict)
+            print(f"Resumed SAE {cfg['name']} from step {start_step}")
+        else:
+            start_step = 0
+            print(f"Starting SAE {cfg['name']} from scratch")
+
+        start_steps.append(start_step)
+        optimizer = torch.optim.Adam(sae.parameters(), lr=cfg["lr"], betas=(cfg["beta1"], cfg["beta2"]))
+        optimizers.append(optimizer)
+
+        # Initialize wandb queue
         log_queue = mp.Queue()
         log_queues.append(log_queue)
-        wandb_config = cfg
         wandb_process = mp.Process(
             target=new_wandb_process,
-            args=(wandb_config, log_queue, cfg.get("wandb_entity", ""), cfg["wandb_project"]),
+            args=(cfg, log_queue, cfg.get("wandb_entity", ""), cfg["wandb_project"]),
         )
         wandb_process.start()
         wandb_processes.append(wandb_process)
 
+    pbar = tqdm.trange(min(start_steps), num_batches)
+
+    # Create progress bars starting from saved steps
+    # pbars = [tqdm.trange(start_step, num_batches, desc=f"SAE {i}")
+    #          for i, start_step in enumerate(start_steps)]
 
     for i in pbar:
         batch = activation_store.next_batch()
-        
+
         for idx, (sae, cfg, optimizer) in enumerate(zip(saes, cfgs, optimizers)):
+            if i < start_steps[idx]:
+                continue
+
             sae_output = sae(batch)
             loss = sae_output["loss"]
-            
+
             # Log metrics to appropriate wandb process
             log_dict = {
                 k: v.item() if isinstance(v, torch.Tensor) and v.dim() == 0 else v
-                for k, v in sae_output.items() if isinstance(v, (int, float)) or 
+                for k, v in sae_output.items() if isinstance(v, (int, float)) or
                 (isinstance(v, torch.Tensor) and v.dim() == 0)
             }
             log_queues[idx].put(log_dict)
@@ -183,18 +215,18 @@ def train_sae_group_seperate_wandb(saes, activation_store, model, cfgs):
                     "save_dir": save_dir
                 })
 
-            pbar.set_postfix({
-                f"Loss_{idx}": f"{loss.item():.4f}", 
-                f"L0_{idx}": f"{sae_output['l0_norm']:.4f}",
-                f"L2_{idx}": f"{sae_output['l2_loss']:.4f}", 
-                f"L1_{idx}": f"{sae_output['l1_loss']:.4f}",
-            })
-            
             loss.backward()
             torch.nn.utils.clip_grad_norm_(sae.parameters(), cfg["max_grad_norm"])
             sae.make_decoder_weights_and_grad_unit_norm()
             optimizer.step()
             optimizer.zero_grad()
+
+            pbar.set_postfix({
+                f"Loss_{idx}": f"{loss.item():.4f}",
+                f"L0_{idx}": f"{sae_output['l0_norm']:.4f}",
+                f"L2_{idx}": f"{sae_output['l2_loss']:.4f}",
+                f"L1_{idx}": f"{sae_output['l1_loss']:.4f}",
+            })
 
     # Final checkpoints
     for idx, (sae, cfg) in enumerate(zip(saes, cfgs)):

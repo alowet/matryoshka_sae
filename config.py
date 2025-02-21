@@ -1,5 +1,6 @@
+import torch
 import transformer_lens.utils as utils
-import torch 
+
 
 def get_default_cfg():
     default_cfg = {
@@ -27,14 +28,14 @@ def get_default_cfg():
         "input_unit_norm": True,
         "perf_log_freq": 1000,
         "sae_type": "topk",
-        "checkpoint_freq": 10000,
+        "checkpoint_freq": 50000,
         "n_batches_to_dead": 20,
 
         # (Batch)TopKSAE specific
         "top_k": 32,
         "top_k_aux": 512,
         "aux_penalty": (1/32),
-        
+
         # for jumprelu
         "bandwidth": 0.001,
     }

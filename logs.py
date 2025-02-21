@@ -1,8 +1,11 @@
-import wandb
-import torch
-from functools import partial
-import os
 import json
+import os
+from functools import partial
+
+import torch
+
+import wandb
+
 
 def init_wandb(cfg):
     return wandb.init(project=cfg["wandb_project"], name=cfg["name"], config=cfg, reinit=True)
@@ -10,7 +13,7 @@ def init_wandb(cfg):
 def log_wandb(output, step, wandb_run, index=None):
     log_dict = {
         k: v.item() if isinstance(v, torch.Tensor) and v.dim() == 0 else v
-        for k, v in output.items() if isinstance(v, (int, float)) or 
+        for k, v in output.items() if isinstance(v, (int, float)) or
         (isinstance(v, torch.Tensor) and v.dim() == 0)
     }
 
@@ -41,7 +44,7 @@ def log_model_performance(wandb_run, step, model, activations_store, sae, index=
     reconstr_loss = model.run_with_hooks(
         batch_tokens,
 
-        
+
         fwd_hooks=[(sae.config["hook_point"], partial(reconstr_hook, sae_out=sae_output))],
         return_type="loss",
     ).item()
@@ -106,3 +109,62 @@ def save_checkpoint(wandb_run, sae, cfg, step):
 
     print(f"Model and config saved as artifact at step {step}")
 
+def find_latest_checkpoint(cfg):
+    """Find the most recent checkpoint for a given config based on step number.
+
+    Args:
+        cfg: Config dictionary containing name field
+    Returns:
+        latest_step: Step number of most recent checkpoint (-1 if none found)
+        checkpoint_dir: Path to most recent checkpoint (None if none found)
+    """
+    if os.getcwd().endswith("alowet"):
+        base_dir = "AISC/matryoshka_sae/checkpoints"
+    else:
+        base_dir = "checkpoints"
+    if not os.path.exists(base_dir):
+        return -1, None
+
+    # Find all checkpoint directories for this run
+    checkpoints = []
+    for dirname in os.listdir(base_dir):
+        if dirname.startswith(cfg['name']):
+            try:
+                step = int(dirname.split('_')[-1])
+                checkpoints.append((step, os.path.join(base_dir, dirname)))
+            except ValueError:
+                continue
+
+    if not checkpoints:
+        return -1, None
+
+    # Return the checkpoint with highest step number
+    latest_step, latest_dir = max(checkpoints, key=lambda x: x[0])
+    return latest_step, latest_dir
+
+def load_checkpoint(cfg, step=None):
+    """Load checkpoint from a specific step or latest if step not specified.
+
+    Args:
+        cfg: Config dictionary
+        step: Optional specific step to load
+    Returns:
+        sae: Loaded SAE model
+        start_step: Step to resume training from
+    """
+    if step is None:
+        step, checkpoint_dir = find_latest_checkpoint(cfg)
+        if step == -1:
+            return None, 0
+    else:
+        checkpoint_dir = f"checkpoints/{cfg['name']}_{step}"
+        if not os.path.exists(checkpoint_dir):
+            return None, 0
+
+    sae_path = os.path.join(checkpoint_dir, "sae.pt")
+    if not os.path.exists(sae_path):
+        return None, 0
+
+    print(f"Loading checkpoint from step {step}")
+    state_dict = torch.load(sae_path)
+    return state_dict, step + 1
